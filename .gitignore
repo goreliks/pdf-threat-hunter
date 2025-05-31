@@ -43,6 +43,7 @@ ENV/
 # Logs and outputs
 *.log
 outputs/
+!langgraph.json
 *.json
 
 # OS specific

@@ -1,0 +1,7 @@
+{
+    "dependencies": ["."],
+    "graphs": {
+      "agent": "./src/pdf_threat_hunter/agents/static_pdf/graph.py:app"
+    },
+    "env": ".env"
+  }
