@@ -4,7 +4,7 @@ import uuid
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from pdf_threat_hunter.core.state import PDFAnalysisState
 from pdf_threat_hunter.tools.safe_shell import SafeShellTool
 from dotenv import load_dotenv
@@ -70,24 +70,61 @@ def initialize_analysis(state: PDFAnalysisState) -> PDFAnalysisState:
 
 def plan_next_command(state: PDFAnalysisState) -> PDFAnalysisState:
     """LLM plans the next command based on the current state and history."""
+    human_message_content = f"""
+Current Iteration: {state['current_iteration']}. PDF under analysis: {state['pdf_filepath']}.
+Max Iterations: {state['max_iterations']}.
+
+Review the initial `pdfid` output (from the first message in our history) and all `accumulated_findings` so far.
+Initial `pdfid` output (for your reference, check message history for full output): [Briefly mention key flags from pdfid like /OpenAction, /JS, /Launch, /EmbeddedFile if available in state, otherwise LLM refers to history]
+Accumulated Findings So Far:
+{state['accumulated_findings'][-5:] if state['accumulated_findings'] else 'None yet.'}
+
+Command History (last 3 commands):
+{state['command_history'][-3:] if state['command_history'] else 'None yet.'}
+
+Your Task:
+Based on the System Prompt's "Threat Hunting Checklist" and all information gathered:
+1.  Identify the most critical uninvestigated lead. This could be an unaddressed `pdfid` flag or a finding from a previous command that requires deeper analysis (e.g., an obfuscated string that needs interpretation, a dumped file that needs `strings` or `grep`).
+2.  If all `pdfid` flags have been thoroughly investigated AND all significant findings (especially obfuscated content, scripts, embedded files) have been explored as deeply as possible with the available tools, you can decide to complete the analysis.
+3.  Otherwise, formulate the *next precise shell command* to execute. Ensure it's from the whitelisted tools and targets a specific investigative goal.
+
+Provide your reasoning and the command in JSON format:
+{{"reasoning": "Explain your decision process: what lead are you following, why is it important, and how will the command help? If completing, explain why all leads are exhausted.", "command_to_run": "your exact shell command here OR ANALYSIS_COMPLETE"}}
+
+Example for reasoning about a command: "The pdfid scan showed /JavaScript > 0. The last command `pdf-parser.py --search /JavaScript ...` found object 12. Now I need to inspect object 12's content and try to decode its stream."
+Example for ANALYSIS_COMPLETE reasoning: "All pdfid flags (/OpenAction, /JS) have been investigated. The JS stream was dumped, analyzed with strings/grep, revealing no further obfuscation or direct malicious calls. The OpenAction led to a benign URI. No further leads for deep analysis exist."
+
+Focus on making tangible progress in understanding the PDF's potential threats. Be methodical.
+If a previous command dumped a file (e.g., `temp_embedded_file`), consider commands like `file temp_embedded_file`, `strings temp_embedded_file`, or `grep PATTERN temp_embedded_file` as next steps.
+If `pdf-parser.py -o X -f <filepath>` was used on an ObjStm, its output contains definitions of embedded objects. Scrutinize this output for suspicious elements within those embedded objects.
+"""
     messages_for_llm = state["messages"] + [
         HumanMessage(
-            content=f"Current Iteration: {state['current_iteration']}. "
-                    f"PDF under analysis: {state['pdf_filepath']}.\n"
-                    f"Accumulated Findings So Far: {state['accumulated_findings']}\n"
-                    f"Command History (last 3): {state['command_history'][-3:] if state['command_history'] else 'None'}\n\n"
-                    "Based on the analysis so far and your overall goal, what is the next logical shell command to run? "
-                    "Provide your reasoning and the exact command in JSON format: "
-                    '{"reasoning": "your reasoning here", "command_to_run": "your shell command here"}. '
-                    "If you think the analysis is complete or you've reached a dead end, output "
-                    '{"reasoning": "reason for completion", "command_to_run": "ANALYSIS_COMPLETE"}.'
+            content=human_message_content
         )
     ]
     
     response = llm.invoke(messages_for_llm)
-    
+    raw_content = response.content
+
+    # --- START MODIFICATION ---
+    # Strip markdown fences if present
+    if raw_content.startswith("```json"):
+        # Remove the opening fence and any leading/trailing whitespace around the JSON
+        json_content = raw_content.split("```json", 1)[1].strip()
+        if json_content.endswith("```"):
+            json_content = json_content[:-3].strip() # Remove the closing fence
+    elif raw_content.startswith("```"): # General case for ``` at start
+        json_content = raw_content.split("```", 1)[1].strip()
+        if json_content.endswith("```"):
+            json_content = json_content[:-3].strip()
+    else:
+        json_content = raw_content # Assume it's already clean JSON
+    # --- END MODIFICATION ---
+
     try:
-        parsed_response = json.loads(response.content)
+        # Use the cleaned json_content for parsing
+        parsed_response = json.loads(json_content) 
         reasoning = parsed_response.get("reasoning", "No reasoning provided.")
         command = parsed_response.get("command_to_run")
 
@@ -97,11 +134,15 @@ def plan_next_command(state: PDFAnalysisState) -> PDFAnalysisState:
             return {**state, "messages": state["messages"] + [response], "next_command_to_run": command, "command_reasoning": reasoning, "analysis_complete": False}
         else:
             # LLM failed to provide a command or ANALYSIS_COMPLETE
-            return {**state, "messages": state["messages"] + [response, HumanMessage(content="LLM did not provide a valid command or ANALYSIS_COMPLETE. Assuming analysis is stuck or complete.")], "analysis_complete": True, "command_reasoning": "LLM response error."}
+            error_message = f"LLM did not provide a valid command or ANALYSIS_COMPLETE. Raw response: {raw_content}"
+            print(f"PLAN_NEXT_COMMAND_ERROR: {error_message}") # Add logging
+            return {**state, "messages": state["messages"] + [response, HumanMessage(content=error_message)], "analysis_complete": True, "command_reasoning": "LLM response error."}
 
-    except json.JSONDecodeError:
-        # LLM didn't output valid JSON
-        return {**state, "messages": state["messages"] + [response, HumanMessage(content="LLM output was not valid JSON. Assuming analysis is stuck or complete.")], "analysis_complete": True, "command_reasoning": "LLM JSON parsing error."}
+    except json.JSONDecodeError as e:
+        # LLM didn't output valid JSON even after stripping
+        error_message = f"LLM output was not valid JSON even after attempting to strip markdown. JSONDecodeError: {e}. Raw content after stripping: '{json_content}'. Original raw content: '{raw_content}'"
+        print(f"PLAN_NEXT_COMMAND_ERROR: {error_message}") # Add logging
+        return {**state, "messages": state["messages"] + [response, HumanMessage(content=error_message)], "analysis_complete": True, "command_reasoning": "LLM JSON parsing error."}
 
 
 def execute_command(state: PDFAnalysisState) -> PDFAnalysisState:
@@ -135,14 +176,37 @@ def interpret_results_and_update_findings(state: PDFAnalysisState) -> PDFAnalysi
     """LLM interprets the command output and updates findings."""
     last_command_info = state["command_history"][-1] if state["command_history"] else {}
     
+    human_message_content = f"""
+Command Executed:
+{last_command_info.get('command', 'N/A')}
+
+Its Output Was:
+STDOUT:
+{last_command_info.get('output', '').split('STDERR:')[0].replace('STDOUT:', '').strip()}
+STDERR:
+{last_command_info.get('output', '').split('STDERR:')[-1].strip() if 'STDERR:' in last_command_info.get('output', '') else 'N/A'}
+
+Your Task:
+Thoroughly interpret this output in the context of our investigation and the System Prompt's "Threat Hunting Checklist".
+1.  What new information or suspicious indicators have you found?
+2.  For each significant new finding, explain:
+    *   What exactly was found? (e.g., specific object definition, string, URL, file type, command structure)
+    *   Why is it suspicious or relevant based on PDF malware TTPs?
+    *   Does this finding point to a specific part of a potential attack chain?
+3.  If the output contains obfuscated data (e.g., a hex string like `<...>`, heavily escaped JS, or content from `strings` that looks encoded), describe it and attempt a preliminary analysis of its potential meaning or purpose, even if you can't fully decode it.
+4.  If the output is from `pdf-parser.py -o X -f <filepath>` on an Object Stream, carefully examine the definitions of the objects embedded *within* that stream. Report any suspicious elements found *inside* those embedded object definitions (e.g., further `/Launch` actions, `/JS`, hex strings).
+5.  If the output is from `strings` or `grep` on a dumped file, list any suspicious strings, URLs, filenames, or commands found.
+
+List any *new, significant findings* as a JSON list of descriptive strings.
+Each string should be a self-contained observation. Example: "Object 12 (JavaScript Stream) contains the function 'eval(gzinflate(base64_decode(...)))', indicating multi-stage obfuscation." OR "Hex string '<2F636D64...>' found in /Launch parameters of object 7, likely a command prompt payload."
+
+Format your response as JSON:
+{{"new_findings": ["Finding 1 as a descriptive string.", "Finding 2 as a descriptive string."]}}
+If no new *significant* findings that advance the investigation, provide an empty list: {{"new_findings": []}}
+"""
     messages_for_llm = state["messages"] + [
         HumanMessage(
-            content=f"Command Executed: {last_command_info.get('command', 'N/A')}\n"
-                    f"Its Output Was:\n{last_command_info.get('output', 'N/A')}\n\n"
-                    "Interpret this output. What new information or suspicious indicators have you found? "
-                    "List any new findings as a JSON list of strings. "
-                    'Example: {"new_findings": ["Found an /OpenAction tag.", "Object 12 contains a large hex-encoded stream."]}'
-                    "If no new significant findings, provide an empty list: {\"new_findings\": []}"
+            content=human_message_content
         )
     ]
     

@@ -20,6 +20,8 @@ class SafeShellTool(BaseTool):
     ALLOWED_EXECUTABLES: list[str] = [
         "file",
         "grep",
+        "cat",
+        "strings",
     ]
 
     # Allowlist of Python scripts. Assumes they are found relative to CWD or have paths.
